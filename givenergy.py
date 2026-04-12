@@ -7,6 +7,8 @@ Strategy:
   - Charge battery from grid during cheap-rate window (2AM-5AM)
   - Discharge battery for home consumption during evening peak (11PM-1:50AM)
   - Eco mode at all other times (solar self-consumption + dynamic charge/discharge)
+  - Dynamic reserve: 30% during discharge (preserve capacity for recharge),
+    4% during eco (maximise self-consumption)
   - Verify inverter settings each run to prevent drift
   - Only write to inverter when state actually needs to change
 
@@ -14,7 +16,8 @@ Hardware constraints:
   - 2.5 kW inverter, 9.5 kWh battery
   - 3h charge window (02:00-05:00) = max ~7.1 kWh chargeable (with losses)
   - 2.83h discharge window (23:00-01:50) = max ~6.6 kWh usable
-  - Reserve 30% ensures battery can always be fully recharged in 3h window
+  - Reserve 30% during discharge ensures battery can be fully recharged in 3h window
+  - Reserve 4% during eco maximises self-consumption savings
   - Li-ion taper above 80% SOC reduces avg charge rate to ~55% of max
 """
 
@@ -240,20 +243,24 @@ def get_current_mode(config, api_key, now_str):
 
 
 def set_eco_mode(config, api_key):
-    """Switch to eco mode: eco on, discharge disabled."""
-    logging.info("Setting ECO mode")
+    """Switch to eco mode: eco on, discharge disabled, low reserve for max self-consumption."""
+    eco_reserve = config.get("eco_reserve_percent", 4)
+    logging.info("Setting ECO mode (reserve %s%%)", eco_reserve)
     write_register(config, api_key, REG_ECO_MODE, True)
     write_register(config, api_key, REG_DISCHARGE_ENABLE, False)
+    write_register(config, api_key, REG_BATTERY_RESERVE, eco_reserve)
 
 
 def set_discharge_mode(config, api_key):
-    """Switch to timed discharge mode: eco off, discharge enabled, set window."""
-    logging.info("Setting DISCHARGE mode (%s - %s)",
-                 config["discharge_start"], config["discharge_end"])
+    """Switch to timed discharge mode: eco off, discharge enabled, high reserve for recharge."""
+    discharge_reserve = config["battery_reserve_percent"]
+    logging.info("Setting DISCHARGE mode (%s - %s, reserve %s%%)",
+                 config["discharge_start"], config["discharge_end"], discharge_reserve)
     write_register(config, api_key, REG_ECO_MODE, False)
     write_register(config, api_key, REG_DISCHARGE_ENABLE, True)
     write_register(config, api_key, REG_DISCHARGE_START, config["discharge_start"])
     write_register(config, api_key, REG_DISCHARGE_END, config["discharge_end"])
+    write_register(config, api_key, REG_BATTERY_RESERVE, discharge_reserve)
 
 
 def verify_charge_schedule(config, api_key):
@@ -283,14 +290,17 @@ def verify_charge_schedule(config, api_key):
         write_register(config, api_key, REG_CHARGE_END, cheap_end)
 
 
-def verify_reserve(config, api_key):
-    """Verify the battery reserve % is set correctly. Fix if not."""
-    desired = config["battery_reserve_percent"]
+def verify_reserve(config, api_key, desired_reserve):
+    """Set the battery reserve % to the desired value for the current mode.
+
+    During discharge mode: reserve = 30% (preserve capacity for cheap-rate recharge)
+    During eco mode: reserve = 4% (maximise self-consumption, let battery run low)
+    """
     current = read_register(config, api_key, REG_BATTERY_RESERVE)
-    if current is not None and current != desired:
-        logging.warning("Battery reserve drift: got %s%%, expected %s%%, fixing",
-                        current, desired)
-        write_register(config, api_key, REG_BATTERY_RESERVE, desired)
+    if current is not None and current != desired_reserve:
+        logging.info("Battery reserve: %s%% -> %s%% (mode-appropriate)",
+                     current, desired_reserve)
+        write_register(config, api_key, REG_BATTERY_RESERVE, desired_reserve)
     elif current is None:
         logging.warning("Could not read battery reserve register")
 
@@ -373,9 +383,6 @@ def run():
     # Always verify the charge schedule is correct (prevents drift)
     verify_charge_schedule(config, api_key)
 
-    # Verify battery reserve % is set correctly (was drifting to 4%)
-    verify_reserve(config, api_key)
-
     # Determine desired mode based on time and SOC
     in_discharge_window = time_in_range(
         now_str, config["discharge_start"], config["discharge_end"]
@@ -386,29 +393,35 @@ def run():
         config["tariff"]["cheap_rate_end"],
     )
 
-    reserve = config["battery_reserve_percent"]
+    discharge_reserve = config["battery_reserve_percent"]  # 30% - preserve for recharge
+    eco_reserve = config["eco_reserve_percent"]            # 4% - maximise self-consumption
 
     # Decision logic
     desired_mode = "eco"
+    desired_reserve = eco_reserve  # Default: let battery run low in eco mode
 
-    if in_discharge_window and soc > reserve:
+    if in_discharge_window and soc > discharge_reserve:
         # Discharge for home consumption during evening/night
         desired_mode = "discharge"
-
+        desired_reserve = discharge_reserve  # Stop at 30% to preserve recharge capacity
     elif in_charge_window:
         # During cheap-rate window, the charge schedule handles it.
-        # Eco mode lets the inverter charge from grid while meeting
-        # house demand from battery/solar if available.
+        # Eco mode lets the inverter charge from grid.
         desired_mode = "eco"
+        desired_reserve = eco_reserve  # Low reserve so battery absorbs all available charge
 
-    # Low battery protection: if SOC hits reserve outside charge window
-    if soc <= reserve and not in_charge_window:
+    # Low battery protection: if SOC hits eco_reserve outside charge window
+    if soc <= eco_reserve and not in_charge_window:
         logging.warning(
-            "Battery at %d%% (reserve %d%%) outside charge window. "
+            "Battery at %d%% (eco reserve %d%%) outside charge window. "
             "Forcing eco to preserve battery.",
-            soc, reserve,
+            soc, eco_reserve,
         )
         desired_mode = "eco"
+        desired_reserve = eco_reserve
+
+    # Set battery reserve to match the desired mode
+    verify_reserve(config, api_key, desired_reserve)
 
     # Pre-charge feasibility check
     if in_charge_window:
@@ -444,8 +457,8 @@ def run():
     current_mode = get_current_mode(config, api_key, now_str)
 
     logging.info(
-        "Current mode: %s | Desired mode: %s | Last set: %s | SOC: %d%%",
-        current_mode, desired_mode, last_mode, soc,
+        "Current mode: %s | Desired mode: %s | Reserve: %s%% | Last set: %s | SOC: %d%%",
+        current_mode, desired_mode, desired_reserve, last_mode, soc,
     )
 
     # Only write to inverter if the desired mode differs from both
@@ -464,6 +477,7 @@ def run():
     # Persist state
     save_last_state({
         "mode": desired_mode,
+        "reserve": desired_reserve,
         "soc": soc,
         "timestamp": now.isoformat(),
     })

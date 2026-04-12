@@ -1,0 +1,5 @@
+config.json
+.last_state.json
+givenergy.log
+__pycache__/
+*.pyc

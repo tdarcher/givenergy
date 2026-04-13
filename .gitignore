@@ -3,3 +3,5 @@ config.json
 givenergy.log
 __pycache__/
 *.pyc
+forecast_log.csv
+daily_log.csv

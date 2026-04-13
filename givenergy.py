@@ -5,28 +5,29 @@ Manages charge/discharge cycles to optimise against time-of-use tariffs.
 
 Strategy:
   - Charge battery from grid during cheap-rate window (2AM-5AM)
-  - DYNAMIC CHARGE LEVEL: use forecast.solar API to predict next-day solar,
-    reduce night charge level to leave headroom for solar capture
-  - Discharge battery for home consumption during evening peak (11PM-1:50AM)
+  - Always charge to 100% (solar forecast disabled -- simple & reliable)
+  - Discharge battery for home consumption during evening/night
+  - Dynamic discharge: start time calculated from current SOC so battery
+    hits 30% reserve exactly at the cheap-rate start (02:00)
   - Eco mode at all other times (solar self-consumption + dynamic charge/discharge)
-  - Dynamic reserve: 30% during discharge (preserve capacity for recharge),
-    4% during eco (maximise self-consumption)
   - Verify inverter settings each run to prevent drift
   - Only write to inverter when state actually needs to change
 
 Hardware constraints:
   - 2.5 kW inverter, 9.5 kWh battery
   - 3h charge window (02:00-05:00) = max ~7.1 kWh chargeable (with losses)
-  - 2.83h discharge window (23:00-01:50) = max ~6.6 kWh usable
+  - Discharge window end 01:50 (10 min before cheap rate) = buffer
   - Reserve 30% during discharge ensures battery can be fully recharged in 3h window
   - Reserve 4% during eco maximises self-consumption savings
   - Li-ion taper above 80% SOC reduces avg charge rate to ~55% of max
 
-Forecast integration:
-  - Uses forecast.solar free API (12 requests/hr, no key needed)
-  - Estimates next-day solar production based on panel orientation
-  - Reduces AC Charge Upper Limit to leave battery headroom for solar
-  - Gain: ~€35-50/year by capturing excess solar at 25c instead of 6c grid charge
+Dynamic discharge timing:
+  - drain_time = (SOC - 30%) * 9.5 / inverter_power_kw (2.5 kW)
+  - In forced discharge, inverter outputs 2.5kW regardless of house load
+    (house takes ~0.45kW, rest exports to grid at 25c/kWh -- all valuable)
+  - start_time = 01:50 - drain_time (with safety margin)
+  - Adjusts every 10 min via cron as SOC changes throughout the day
+  - Minimum discharge window 30min
 """
 
 import csv
@@ -674,6 +675,93 @@ def estimate_charge_time(config, from_soc, to_soc=100):
     return time_below + time_above
 
 
+def calculate_discharge_start(soc, config):
+    """Calculate the optimal discharge start time so battery hits reserve
+    at the charge window start.
+
+    Works backwards from the discharge end time (10 min before cheap rate):
+      1. How much energy must drain? (SOC - reserve) * capacity
+      2. How long at inverter power? drain_kwh / inverter_power_kw
+         In forced discharge, the inverter pumps out at full rate regardless
+         of house load. House takes what it needs, rest exports to grid --
+         both are financially valuable.
+      3. Apply safety margin (start slightly earlier)
+      4. start_time = discharge_end - drain_time
+
+    Returns: "HH:MM" string for the calculated start time.
+
+    Clamp rules:
+      - Never shorter than `min_discharge_minutes` (minimum discharge window)
+      - If SOC already at/below reserve, don't discharge at all (return None)
+    """
+    dyn = config.get("dynamic_discharge", {})
+    if not dyn.get("enabled", False):
+        # Fallback to fixed time from config
+        return config.get("discharge_start", "23:00")
+
+    reserve = config["battery_reserve_percent"]
+    capacity = config["battery_capacity_kwh"]
+    inverter_power_kw = config.get("inverter_power_kw", 2.5)
+    min_minutes = dyn.get("min_discharge_minutes", 30)
+    safety = dyn.get("safety_margin", 0.9)  # multiply drain time by this to start earlier
+
+    # If already at or below reserve, no discharge needed
+    if soc <= reserve:
+        logging.info(
+            "Dynamic discharge: SOC %d%% <= reserve %d%%, no discharge needed",
+            soc, reserve,
+        )
+        return None
+
+    # Energy to drain from SOC down to reserve
+    drain_pct = soc - reserve
+    drain_kwh = drain_pct / 100.0 * capacity
+
+    # Time to drain at inverter discharge power
+    # In forced discharge mode, the inverter outputs at full power;
+    # house absorbs ~0.45kW, the rest exports to grid at 25c/kWh
+    drain_hours = drain_kwh / inverter_power_kw
+
+    # Apply safety margin: start earlier so we hit reserve *before* charge window
+    # safety < 1 means "I only trust 90% of the estimate, so start 10% earlier"
+    drain_hours_adjusted = drain_hours / safety
+
+    # Clamp to minimum discharge window
+    drain_minutes_adjusted = max(drain_hours_adjusted * 60, min_minutes)
+    drain_hours_adjusted = drain_minutes_adjusted / 60.0
+
+    # Discharge end time in minutes from midnight (10 min before cheap rate)
+    discharge_end = config.get("discharge_end", config["tariff"]["cheap_rate_start"])
+    end_min = int(discharge_end[:2]) * 60 + int(discharge_end[3:])
+
+    # Discharge start = end time - adjusted drain time
+    start_min = end_min - int(drain_hours_adjusted * 60)
+
+    # Handle overnight wrap: if start_min goes negative, it means start previous day
+    # E.g., cheap_start=02:00 (120min), drain 5h (300min) -> start=-180 -> previous day 21:00
+    if start_min < 0:
+        start_min += 24 * 60  # wrap to previous day
+
+    # Note: no earliest-start clamp -- pure calculation.
+    # Inverter-rate discharge empties the battery fast (2.5kW),
+    # so the start time is naturally close to the end time.
+    # If we clamped to 18:00, the battery would hit reserve hours early
+    # and sit idle instead of providing eco mode self-consumption.
+
+    start_hhmm = f"{start_min // 60:02d}:{start_min % 60:02d}"
+
+    logging.info(
+        "Dynamic discharge: SOC %d%% -> reserve %d%% = %.2f kWh to drain, "
+        "inverter %.1f kW, drain_time %.1fh (adj %.1fh), "
+        "start %s -> end %s",
+        soc, reserve, drain_kwh, inverter_power_kw,
+        drain_hours, drain_hours_adjusted,
+        start_hhmm, discharge_end,
+    )
+
+    return start_hhmm
+
+
 # ---------------------------------------------------------------------------
 # High-level inverter operations
 # ---------------------------------------------------------------------------
@@ -742,15 +830,21 @@ def set_eco_mode(config, api_key):
     write_register(config, api_key, REG_BATTERY_RESERVE, eco_reserve)
 
 
-def set_discharge_mode(config, api_key):
-    """Switch to timed discharge mode: eco off, discharge enabled, high reserve for recharge."""
+def set_discharge_mode(config, api_key, start_time=None):
+    """Switch to timed discharge mode: eco off, discharge enabled, high reserve for recharge.
+    
+    Args:
+        start_time: HH:MM string for discharge start. If None, uses config default.
+    """
     discharge_reserve = config["battery_reserve_percent"]
+    actual_start = start_time or config.get("discharge_start", "23:00")
+    discharge_end = config.get("discharge_end", config["tariff"]["cheap_rate_start"])
     logging.info("Setting DISCHARGE mode (%s - %s, reserve %s%%)",
-                 config["discharge_start"], config["discharge_end"], discharge_reserve)
+                 actual_start, discharge_end, discharge_reserve)
     write_register(config, api_key, REG_ECO_MODE, False)
     write_register(config, api_key, REG_DISCHARGE_ENABLE, True)
-    write_register(config, api_key, REG_DISCHARGE_START, config["discharge_start"])
-    write_register(config, api_key, REG_DISCHARGE_END, config["discharge_end"])
+    write_register(config, api_key, REG_DISCHARGE_START, actual_start)
+    write_register(config, api_key, REG_DISCHARGE_END, discharge_end)
     write_register(config, api_key, REG_BATTERY_RESERVE, discharge_reserve)
 
 
@@ -953,10 +1047,8 @@ def run():
     verify_charge_schedule(config, api_key)
 
     # -----------------------------------------------------------------------
-    # Solar forecast -> dynamic charge limit
+    # Charge limit: always 100% (dynamic forecast disabled)
     # -----------------------------------------------------------------------
-    # Fetch forecast just before the charge window starts (or during it).
-    # After the charge window ends, reset to 100% for the next cycle.
     in_charge_window = time_in_range(
         now_str,
         config["tariff"]["cheap_rate_start"],
@@ -965,77 +1057,75 @@ def run():
 
     fc = config.get("solar_forecast", {})
     forecast_enabled = fc.get("enabled", False)
+    desired_charge_limit = 100
+    daytime_load = fc.get("daytime_load_kwh", 5.0)
 
-    # -----------------------------------------------------------------------
-    # Consumption profile (auto-fetched from API, cached for 24h)
-    # -----------------------------------------------------------------------
-    last_state = load_last_state()
-    daytime_load = get_effective_daytime_load(config, last_state)
+    if forecast_enabled:
+        # Dynamic forecast mode: fetch forecast, calculate charge limit
+        last_state = load_last_state()
+        daytime_load = get_effective_daytime_load(config, last_state)
 
-    # Refresh consumption profile once per day (first run after midnight or
-    # if no cached value exists). Charge window (02-05) is a good time.
-    need_refresh = False
-    cached_profile = last_state.get("consumption_profile", {})
-    if not cached_profile:
-        need_refresh = True
-    else:
-        try:
-            cached_time = datetime.fromisoformat(cached_profile.get("fetched_at", ""))
-            if (datetime.now() - cached_time).total_seconds() > 24 * 3600:
-                need_refresh = True
-        except (ValueError, TypeError):
+        # Refresh consumption profile once per day
+        need_refresh = False
+        cached_profile = last_state.get("consumption_profile", {})
+        if not cached_profile:
             need_refresh = True
+        else:
+            try:
+                cached_time = datetime.fromisoformat(cached_profile.get("fetched_at", ""))
+                if (datetime.now() - cached_time).total_seconds() > 24 * 3600:
+                    need_refresh = True
+            except (ValueError, TypeError):
+                need_refresh = True
 
-    if need_refresh and in_charge_window:
-        logging.info("Refreshing consumption profile from energy-flows API...")
-        profile = fetch_consumption_profile(config, api_key, days=7)
-        if profile:
-            profile["fetched_at"] = now.isoformat()
-            last_state["consumption_profile"] = profile
-            daytime_load = profile["daytime_load_kwh"]
-            logging.info(
-                "Updated daytime load from API: %.1f kWh (was %.1f kWh default)",
-                daytime_load, fc.get("daytime_load_kwh", 5.0),
+        if need_refresh and in_charge_window:
+            logging.info("Refreshing consumption profile from energy-flows API...")
+            profile = fetch_consumption_profile(config, api_key, days=7)
+            if profile:
+                profile["fetched_at"] = now.isoformat()
+                last_state["consumption_profile"] = profile
+                daytime_load = profile["daytime_load_kwh"]
+                logging.info(
+                    "Updated daytime load from API: %.1f kWh (was %.1f kWh default)",
+                    daytime_load, fc.get("daytime_load_kwh", 5.0),
+                )
+
+        # Fetch forecast and calculate dynamic charge limit
+        if in_charge_window or now.hour < 5:
+            forecast_kwh = fetch_solar_forecast(config)
+            desired_charge_limit = calculate_dynamic_charge_limit(
+                config, forecast_kwh, daytime_load=daytime_load,
             )
-
-    # Only set dynamic charge limit BEFORE or during the charge window.
-    # After the window (05:00+), reset to 100% so eco mode can fill freely.
-    forecast_kwh = None
-    forecast_target_date = ""
-    if forecast_enabled and (in_charge_window or now.hour < 5):
-        forecast_kwh = fetch_solar_forecast(config)
-        desired_charge_limit = calculate_dynamic_charge_limit(
-            config, forecast_kwh, daytime_load=daytime_load,
-        )
-        # Log the forecast for accuracy tracking
-        if forecast_kwh and in_charge_window and now.hour < 3:
-            # Only log once per night (first charge-window run at 02:xx)
-            # Determine target date (tomorrow)
-            target_dt = now + timedelta(days=1)
-            forecast_target_date = target_dt.strftime("%Y-%m-%d")
-            log_forecast(config, forecast_kwh, forecast_target_date,
-                         desired_charge_limit, daytime_load)
-    else:
-        desired_charge_limit = 100
-        if forecast_enabled:
+            if forecast_kwh and in_charge_window and now.hour < 3:
+                target_dt = now + timedelta(days=1)
+                forecast_target_date = target_dt.strftime("%Y-%m-%d")
+                log_forecast(config, forecast_kwh, forecast_target_date,
+                             desired_charge_limit, daytime_load)
+        else:
             logging.info("Outside forecast window -- charge limit stays at 100%%")
 
-    # -----------------------------------------------------------------------
-    # Backfill forecast actuals + daily log (once per day, early morning)
-    # -----------------------------------------------------------------------
-    if forecast_enabled and in_charge_window and now.hour == 2:
-        backfill_forecast_actuals(config, api_key)
-        log_daily(config, api_key, soc)
+        # Backfill forecast actuals + daily log (once per day, early morning)
+        if in_charge_window and now.hour == 2:
+            backfill_forecast_actuals(config, api_key)
+            log_daily(config, api_key, soc)
+    else:
+        logging.info("Solar forecast disabled -- always charging to 100%%")
 
     verify_charge_limit(config, api_key, desired_charge_limit)
 
     # -----------------------------------------------------------------------
     # Mode decision
     # -----------------------------------------------------------------------
-    # Determine desired mode based on time and SOC
-    in_discharge_window = time_in_range(
-        now_str, config["discharge_start"], config["discharge_end"]
-    )
+    # Calculate dynamic discharge start time (based on current SOC)
+    dynamic_start = calculate_discharge_start(soc, config)
+    discharge_end = config.get("discharge_end", config["tariff"]["cheap_rate_start"])
+
+    # If dynamic start is None, SOC is already at/below reserve - skip discharge
+    if dynamic_start is None:
+        in_discharge_window = False
+        logging.info("No discharge window: SOC already at/below reserve")
+    else:
+        in_discharge_window = time_in_range(now_str, dynamic_start, discharge_end)
 
     discharge_reserve = config["battery_reserve_percent"]  # 30% - preserve for recharge
     eco_reserve = config["eco_reserve_percent"]            # 4% - maximise self-consumption
@@ -1103,9 +1193,10 @@ def run():
 
     logging.info(
         "Current mode: %s | Desired mode: %s | Reserve: %s%% | "
-        "Charge limit: %d%% | Last set: %s | SOC: %d%%",
+        "Charge limit: %d%% | Discharge: %s-%s | Last set: %s | SOC: %d%%",
         current_mode, desired_mode, desired_reserve,
-        desired_charge_limit, last_mode, soc,
+        desired_charge_limit, dynamic_start or "N/A", discharge_end,
+        last_mode, soc,
     )
 
     # Only write to inverter if the desired mode differs from both
@@ -1119,7 +1210,7 @@ def run():
         if desired_mode == "eco":
             set_eco_mode(config, api_key)
         elif desired_mode == "discharge":
-            set_discharge_mode(config, api_key)
+            set_discharge_mode(config, api_key, start_time=dynamic_start)
 
     # Persist state (reset consecutive_errors on success)
     # Preserve consumption_profile cache for next run
@@ -1127,6 +1218,7 @@ def run():
         "mode": desired_mode,
         "reserve": desired_reserve,
         "charge_limit": desired_charge_limit,
+        "discharge_start": dynamic_start,
         "soc": soc,
         "timestamp": now.isoformat(),
         "consecutive_errors": 0,

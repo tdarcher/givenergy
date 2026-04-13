@@ -4,4 +4,5 @@ givenergy.log
 __pycache__/
 *.pyc
 forecast_log.csv
-daily_log.csv
+daily_log.csvcheck_status.py
+givenergy.log*
